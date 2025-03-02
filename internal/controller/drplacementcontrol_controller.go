@@ -563,43 +563,6 @@ func GetDRClusters(ctx context.Context, client client.Client, drPolicy *rmn.DRPo
 	return drClusters, nil
 }
 
-// updateObjectMetadata updates drpc labels, annotations and finalizer, and also updates placementObj finalizer
-func (r DRPlacementControlReconciler) updateObjectMetadata(ctx context.Context,
-	drpc *rmn.DRPlacementControl, placementObj client.Object, log logr.Logger,
-) error {
-	var update bool
-
-	update = rmnutil.AddLabel(drpc, rmnutil.OCMBackupLabelKey, rmnutil.OCMBackupLabelValue)
-	update = rmnutil.AddFinalizer(drpc, DRPCFinalizer) || update
-
-	vrgNamespace, err := selectVRGNamespace(r.Client, r.Log, drpc, placementObj)
-	if err != nil {
-		return err
-	}
-
-	update = rmnutil.AddAnnotation(drpc, DRPCAppNamespace, vrgNamespace) || update
-
-	if update {
-		if err := r.Update(ctx, drpc); err != nil {
-			log.Error(err, "Failed to add annotations, labels, or finalizer to drpc")
-
-			return fmt.Errorf("%w", err)
-		}
-	}
-
-	// add finalizer to User PlacementRule/Placement
-	finalizerAdded := rmnutil.AddFinalizer(placementObj, DRPCFinalizer)
-	if finalizerAdded {
-		if err := r.Update(ctx, placementObj); err != nil {
-			log.Error(err, "Failed to add finalizer to user placement rule")
-
-			return fmt.Errorf("%w", err)
-		}
-	}
-
-	return nil
-}
-
 func (r *DRPlacementControlReconciler) processDeletion(ctx context.Context,
 	drpc *rmn.DRPlacementControl, placementObj client.Object, log logr.Logger,
 ) error {
@@ -847,23 +810,6 @@ func (r *DRPlacementControlReconciler) finalizePlacement(
 	return nil
 }
 
-func (r *DRPlacementControlReconciler) updateAndSetOwner(
-	ctx context.Context,
-	drpc *rmn.DRPlacementControl,
-	usrPlacement client.Object,
-	log logr.Logger,
-) (bool, error) {
-	if err := r.annotateObject(ctx, drpc, usrPlacement, log); err != nil {
-		return false, err
-	}
-
-	if err := r.updateObjectMetadata(ctx, drpc, usrPlacement, log); err != nil {
-		return false, err
-	}
-
-	return r.setDRPCOwner(ctx, drpc, usrPlacement, log)
-}
-
 func getPlacementOrPlacementRule(
 	ctx context.Context,
 	k8sclient client.Client,
@@ -896,6 +842,166 @@ func getPlacementOrPlacementRule(
 	}
 
 	return usrPlacement, nil
+}
+
+func (r *DRPlacementControlReconciler) updateAndSetOwner(
+	ctx context.Context,
+	drpc *rmn.DRPlacementControl,
+	usrPlacement client.Object,
+	log logr.Logger,
+) (bool, error) {
+	// Step 1: Prepare modifications to both objects
+	drpcModified, placementModified, err := r.prepareObjectModifications(drpc, usrPlacement, log)
+	if err != nil {
+		return false, err
+	}
+
+	// Step 2: Apply updates to both objects if needed
+	return r.applyUpdates(ctx, drpc, usrPlacement, drpcModified, placementModified, log)
+}
+
+// prepareObjectModifications prepares all in-memory modifications to both DRPC and placement objects
+func (r *DRPlacementControlReconciler) prepareObjectModifications(
+	drpc *rmn.DRPlacementControl,
+	usrPlacement client.Object,
+	log logr.Logger,
+) (bool, bool, error) {
+	var drpcModified, placementModified bool
+
+	// Annotate the placement object
+	mod, err := r.annotateObject(drpc, usrPlacement, log)
+	if err != nil {
+		return false, false, err
+	}
+	placementModified = placementModified || mod
+
+	// Modify DRPC and placement via metadata updates
+	modDRPC, modPlacement, err := r.updateObjectMetadata(drpc, usrPlacement)
+	if err != nil {
+		return false, false, err
+	}
+	drpcModified = drpcModified || modDRPC
+	placementModified = placementModified || modPlacement
+
+	// Modify DRPC to set the owner reference
+	mod, err = r.setDRPCOwner(drpc, usrPlacement, log)
+	if err != nil {
+		return false, false, err
+	}
+	drpcModified = drpcModified || mod
+
+	return drpcModified, placementModified, nil
+}
+
+// applyUpdates applies updates to both DRPC and placement objects if they were modified
+func (r *DRPlacementControlReconciler) applyUpdates(
+	ctx context.Context,
+	drpc *rmn.DRPlacementControl,
+	usrPlacement client.Object,
+	drpcModified bool,
+	placementModified bool,
+	log logr.Logger,
+) (bool, error) {
+	// Update DRPC only once if there were any changes
+	if drpcModified {
+		log.Info(fmt.Sprintf("Update DRPC updateAndSetOwner, Annotations: %v finalizers: %v ownerReferance: %v",
+			drpc.ObjectMeta.Annotations, drpc.ObjectMeta.Finalizers, drpc.ObjectMeta.OwnerReferences))
+		err := r.Update(ctx, drpc)
+		if err != nil {
+			log.Error(err, "Failed to update DRPC")
+			return false, fmt.Errorf("failed to update DRPC %s (%w)", drpc.GetName(), err)
+		}
+	}
+
+	// Update Placement object only once if there were any changes
+	if placementModified {
+		log.Info(fmt.Sprintf("Update Placement updateAndSetOwner, Annotations: %v finalizers: %v ownerReferance: %v",
+			usrPlacement.GetAnnotations(), usrPlacement.GetFinalizers(), usrPlacement.GetOwnerReferences()))
+		if err := r.Update(ctx, usrPlacement); err != nil {
+			log.Error(err, "Failed to update Placement object")
+			return false, fmt.Errorf("failed to update placement %s (%w)", usrPlacement.GetName(), err)
+		}
+	}
+
+	log.Info("Successfully updated DRPC and Placement in a single update per resource")
+	return true, nil
+}
+
+func (r *DRPlacementControlReconciler) annotateObject(drpc *rmn.DRPlacementControl, obj client.Object, log logr.Logger) (bool, error) {
+	if rmnutil.ResourceIsDeleted(obj) {
+		return false, nil
+	}
+
+	if obj.GetAnnotations() == nil {
+		obj.SetAnnotations(map[string]string{})
+	}
+
+	ownerName := obj.GetAnnotations()[DRPCNameAnnotation]
+	ownerNamespace := obj.GetAnnotations()[DRPCNamespaceAnnotation]
+
+	if ownerName == "" {
+		log.Info(fmt.Sprintf("Update Placement annotateObject, Annotations: %v finalizers: %v ownerReferance: %v",
+			obj.GetAnnotations(), obj.GetFinalizers(), obj.GetOwnerReferences()))
+		obj.GetAnnotations()[DRPCNameAnnotation] = drpc.Name
+		obj.GetAnnotations()[DRPCNamespaceAnnotation] = drpc.Namespace
+
+		return true, nil
+	}
+
+	if ownerName != drpc.Name || ownerNamespace != drpc.Namespace {
+		log.Info("Object not owned by this DRPC", "objName", obj.GetName())
+
+		return false, fmt.Errorf("object %s not owned by this DRPC '%s/%s'",
+			obj.GetName(), drpc.Name, drpc.Namespace)
+	}
+
+	return false, nil
+}
+
+// updateObjectMetadata updates drpc labels, annotations and finalizer, and also updates placementObj finalizer
+func (r *DRPlacementControlReconciler) updateObjectMetadata(drpc *rmn.DRPlacementControl, placementObj client.Object) (drpcModified bool, placementModified bool, err error) {
+	// Modify DRPC in memory.
+	if rmnutil.AddLabel(drpc, rmnutil.OCMBackupLabelKey, rmnutil.OCMBackupLabelValue) {
+		drpcModified = true
+	}
+	added := rmnutil.AddFinalizer(drpc, DRPCFinalizer)
+
+	if added {
+		drpcModified = true
+	}
+
+	vrgNamespace, err := selectVRGNamespace(r.Client, r.Log, drpc, placementObj)
+	if err != nil {
+		return drpcModified, placementModified, err
+	}
+
+	if rmnutil.AddAnnotation(drpc, DRPCAppNamespace, vrgNamespace) {
+		drpcModified = true
+	}
+
+	// Modify Placement object in memory.
+	if rmnutil.AddFinalizer(placementObj, DRPCFinalizer) {
+		placementModified = true
+	}
+
+	return drpcModified, placementModified, nil
+}
+
+func (r *DRPlacementControlReconciler) setDRPCOwner(drpc *rmn.DRPlacementControl, owner client.Object, log logr.Logger) (bool, error) {
+	// Check if the owner reference is already set.
+	for _, ownerReference := range drpc.GetOwnerReferences() {
+		if ownerReference.Name == owner.GetName() {
+			return false, nil // No change needed.
+		}
+	}
+
+	// Set the owner reference in memory.
+	err := ctrl.SetControllerReference(owner, drpc, r.Client.Scheme())
+	if err != nil {
+		return false, fmt.Errorf("failed to set DRPC owner %w", err)
+	}
+
+	return true, nil
 }
 
 func getPlacementRule(ctx context.Context, k8sclient client.Client,
@@ -981,71 +1087,6 @@ func getPlacement(ctx context.Context, k8sclient client.Client,
 	}
 
 	return usrPlmnt, nil
-}
-
-func (r *DRPlacementControlReconciler) annotateObject(ctx context.Context,
-	drpc *rmn.DRPlacementControl, obj client.Object, log logr.Logger,
-) error {
-	if rmnutil.ResourceIsDeleted(obj) {
-		return nil
-	}
-
-	if obj.GetAnnotations() == nil {
-		obj.SetAnnotations(map[string]string{})
-	}
-
-	ownerName := obj.GetAnnotations()[DRPCNameAnnotation]
-	ownerNamespace := obj.GetAnnotations()[DRPCNamespaceAnnotation]
-
-	if ownerName == "" {
-		obj.GetAnnotations()[DRPCNameAnnotation] = drpc.Name
-		obj.GetAnnotations()[DRPCNamespaceAnnotation] = drpc.Namespace
-
-		err := r.Update(ctx, obj)
-		if err != nil {
-			log.Error(err, "Failed to update Object annotation", "objName", obj.GetName())
-
-			return fmt.Errorf("failed to update Object %s annotation '%s/%s' (%w)",
-				obj.GetName(), DRPCNameAnnotation, drpc.Name, err)
-		}
-
-		return nil
-	}
-
-	if ownerName != drpc.Name || ownerNamespace != drpc.Namespace {
-		log.Info("Object not owned by this DRPC", "objName", obj.GetName())
-
-		return fmt.Errorf("object %s not owned by this DRPC '%s/%s'",
-			obj.GetName(), drpc.Name, drpc.Namespace)
-	}
-
-	return nil
-}
-
-func (r *DRPlacementControlReconciler) setDRPCOwner(
-	ctx context.Context, drpc *rmn.DRPlacementControl, owner client.Object, log logr.Logger,
-) (bool, error) {
-	const updated = true
-
-	for _, ownerReference := range drpc.GetOwnerReferences() {
-		if ownerReference.Name == owner.GetName() {
-			return !updated, nil // ownerreference already set
-		}
-	}
-
-	err := ctrl.SetControllerReference(owner, drpc, r.Client.Scheme())
-	if err != nil {
-		return !updated, fmt.Errorf("failed to set DRPC owner %w", err)
-	}
-
-	err = r.Update(ctx, drpc)
-	if err != nil {
-		return !updated, fmt.Errorf("failed to update drpc %s (%w)", drpc.GetName(), err)
-	}
-
-	log.Info(fmt.Sprintf("Object %s owns DRPC %s", owner.GetName(), drpc.GetName()))
-
-	return updated, nil
 }
 
 func (r *DRPlacementControlReconciler) getOrClonePlacementRule(ctx context.Context,
